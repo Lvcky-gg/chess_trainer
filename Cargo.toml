@@ -1,0 +1,22 @@
+[package]
+name = "chess_trainer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.19.1"
+# Legal move generation, FEN/SAN/UCI conversion.
+shakmaty = "0.30.1"
+
+# The `stockfish` wrapper crate was dropped in favour of speaking UCI directly
+# (see src/engine.rs): it can consume the `bestmove` line while fetching the FEN
+# and block forever, and it offers no way to bound the opponent's thinking time.
+
+# The STL assets are ~25 MB / 500k triangles each. Parsing six of them in an
+# unoptimised debug build takes tens of seconds, so always optimise dependencies
+# and give our own code enough optimisation to load quickly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
