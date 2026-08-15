@@ -248,10 +248,17 @@ fn start_engine(path: &std::path::Path, skill: Option<u32>) -> std::io::Result<U
 }
 
 pub fn start(skill: u32) -> EngineLink {
+    start_with(discover_stockfish(), skill)
+}
+
+/// Discovery is a parameter so that the not-found path stays testable. Probing
+/// it through `start` would mean hiding every Stockfish on the machine — PATH
+/// and `/usr/bin` included — which no environment variable can do.
+fn start_with(path: Option<PathBuf>, skill: u32) -> EngineLink {
     let (req_tx, req_rx) = mpsc::channel::<EngineRequest>();
     let (rep_tx, rep_rx) = mpsc::channel::<EngineReply>();
 
-    let Some(path) = discover_stockfish() else {
+    let Some(path) = path else {
         let msg =
             "Stockfish not found - install it (e.g. `yay -S stockfish`) or set STOCKFISH_PATH"
                 .to_string();
@@ -467,16 +474,22 @@ mod integration {
 
     #[test]
     fn a_missing_binary_is_reported_rather_than_panicking() {
-        unsafe { std::env::set_var("STOCKFISH_PATH", "/nonexistent/stockfish") };
-
-        let link = start(5);
+        let link = start_with(None, 5);
         assert!(!link.available);
         assert!(
             link.status.contains("not found"),
             "status was: {}",
             link.status
         );
+    }
 
+    #[test]
+    fn an_explicit_path_to_a_non_file_is_not_accepted() {
+        unsafe { std::env::set_var("STOCKFISH_PATH", "/nonexistent/stockfish") };
+        let found = discover_stockfish();
         unsafe { std::env::remove_var("STOCKFISH_PATH") };
+
+        // It may still fall back to a real install, but never to the bad path.
+        assert_ne!(found, Some(PathBuf::from("/nonexistent/stockfish")));
     }
 }

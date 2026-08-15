@@ -40,6 +40,7 @@ are parsed at startup.
 |---|---|
 | Click a piece, then a destination | Move. Legal targets are highlighted, captures in red |
 | `H` | Toggle a hint showing the analyst's preferred move |
+| `S` | Toggle the accuracy breakdown (opens by itself at game over) |
 | `U` | Take back your last move (and the engine's reply) |
 | `N` | New game |
 | `[` / `]` | Lower / raise engine strength |
@@ -62,12 +63,51 @@ and it is classified the way most online trainers do it:
 When your move was not the analyst's choice, the better move is named in SAN.
 The bar on the left is the running evaluation, always from White's point of view.
 
+### Accuracy by stage
+
+Per-move grades say a move cost 0.6 pawns; they never say *which part of your
+game* keeps leaking. Every graded move is therefore also filed under the stage
+it was chosen in, and `S` shows the breakdown:
+
+```
+Opening      96%   8 moves
+Middlegame   71%   18 moves
+   2 mistakes, 1 blunder
+   worst  19. Qd2  -3.10
+Endgame      88%   9 moves
+
+Overall      82%
+Weakest      Middlegame
+```
+
+The stage is that of the position the move was *chosen in*, so the blunder that
+trades the last queens is charged to the middlegame rather than to the endgame
+it created. Stages are classified from the position alone:
+
+| Stage | Test |
+|---|---|
+| Endgame | Non-pawn material (Q9 R5 B3 N3, both sides) ≤ 20 |
+| Opening | Not an endgame, move ≤ 15, **and** ≥ 4 minor pieces still on home squares |
+| Middlegame | Everything else |
+
+Both opening bounds are needed: a gambit can leave a piece at home until move
+30, and a quiet exchange line can be fully developed by move 8.
+
+Accuracy is not linear in centipawns. It is Lichess' formula — centipawns are
+first mapped to winning chances, then the drop across your move is mapped to
+0–100 — because giving away 150cp from a level position costs far more of the
+game than giving away 150cp when already three pawns up.
+
+Takebacks discard the reviews of the moves they undo, so a position you rewound
+is not still counted against you.
+
 ## Layout
 
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | App wiring, engine request/reply loop, keyboard |
 | `src/game.rs` | Rules (via shakmaty), move grading, takebacks |
+| `src/review.rs` | Stage classification, accuracy, per-stage summary |
 | `src/engine.rs` | UCI client, engine worker thread, score normalisation |
 | `src/scene.rs` | Board, piece models, highlighting, camera, clicking |
 | `src/stl.rs` | Binary STL loading, decimation, normalisation |

@@ -1,5 +1,6 @@
 mod engine;
 mod game;
+mod review;
 mod scene;
 mod stl;
 mod ui;
@@ -147,6 +148,10 @@ fn keyboard(
 ) {
     if keys.just_pressed(KeyCode::KeyH) {
         game.show_hint = !game.show_hint;
+    }
+
+    if keys.just_pressed(KeyCode::KeyS) {
+        game.show_summary = !game.show_summary;
     }
 
     if keys.just_pressed(KeyCode::KeyU) {

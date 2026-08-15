@@ -7,6 +7,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{Chess, Color as ChessColor, EnPassantMode, Move, Position, Role, Square};
 
 use crate::engine::Score;
+use crate::review::{self, MoveReview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -81,6 +82,9 @@ pub struct Game {
     pub history: Vec<String>,
     pub skill: u32,
     pub result_text: Option<String>,
+    /// Every graded player move, for the per-stage accuracy breakdown.
+    pub reviews: Vec<MoveReview>,
+    pub show_summary: bool,
     snapshots: Vec<Chess>,
 }
 
@@ -109,6 +113,8 @@ impl Game {
             history: Vec::new(),
             skill,
             result_text: None,
+            reviews: Vec::new(),
+            show_summary: false,
             snapshots: Vec::new(),
         }
     }
@@ -132,6 +138,8 @@ impl Game {
         self.best_move = None;
         self.show_hint = false;
         self.result_text = None;
+        // Moves that no longer happened should not still be counted against you.
+        self.reviews.retain(|r| r.ply <= self.ply);
         self.phase = if self.pos.turn() == self.player {
             Phase::PlayerTurn
         } else {
@@ -223,6 +231,7 @@ impl Game {
         if self.pos.is_game_over() {
             self.phase = Phase::GameOver;
             self.result_text = Some(self.describe_outcome());
+            self.show_summary = true;
         } else if self.free_play || self.pos.turn() == self.player {
             self.phase = Phase::PlayerTurn;
         } else {
@@ -282,12 +291,55 @@ impl Game {
             })
             .filter(|best| !played_san.ends_with(best.as_str()));
 
+        let quality = Quality::from_loss(loss);
+
+        let accuracy =
+            review::accuracy_for_mover(mover == ChessColor::White, before.to_cp(), after.to_cp());
+        self.record_review(ply, quality, loss, accuracy, &played_san);
+
         self.last_grade = Some(Grade {
-            quality: Quality::from_loss(loss),
+            quality,
             loss_cp: loss,
             played_san,
             better_san,
         });
+    }
+
+    /// File the graded move under the stage it was *chosen in*, so that a
+    /// blunder on the move the queens come off is charged to the middlegame
+    /// rather than to the endgame it created.
+    fn record_review(
+        &mut self,
+        ply: u32,
+        quality: Quality,
+        loss_cp: i32,
+        accuracy: f32,
+        san: &str,
+    ) {
+        let Some(pre_move) = self.snapshots.last() else {
+            return;
+        };
+        let stage = review::classify(pre_move);
+
+        // A takeback replays plies that were already graded; keep one entry each.
+        self.reviews.retain(|r| r.ply != ply);
+        self.reviews.push(MoveReview {
+            ply,
+            stage,
+            quality,
+            loss_cp,
+            accuracy,
+            san: san.to_string(),
+        });
+        self.reviews.sort_by_key(|r| r.ply);
+    }
+
+    pub fn stage_summary(&self) -> Vec<review::StageStats> {
+        review::summarise(&self.reviews)
+    }
+
+    pub fn overall_accuracy(&self) -> Option<f32> {
+        review::overall_accuracy(&self.reviews)
     }
 }
 
@@ -440,6 +492,85 @@ mod tests {
 
         let grade = game.last_grade.unwrap();
         assert_eq!(grade.better_san.as_deref(), Some("d4"));
+    }
+
+    #[test]
+    fn a_graded_move_is_filed_under_the_stage_it_was_played_in() {
+        use crate::review::Stage;
+
+        let mut game = white_game();
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+
+        game.evals.insert(0, Score::Centipawns(20));
+        game.evals.insert(1, Score::Centipawns(10));
+        game.grade(1);
+
+        assert_eq!(game.reviews.len(), 1);
+        let review = &game.reviews[0];
+        assert_eq!(review.ply, 1);
+        assert_eq!(review.stage, Stage::Opening);
+        assert_eq!(review.quality, Quality::Best);
+        // Barely anything given away, so accuracy should be near perfect.
+        assert!(review.accuracy > 95.0, "{}", review.accuracy);
+    }
+
+    #[test]
+    fn a_blunder_by_black_is_scored_from_blacks_side() {
+        let mut game = Game::new(ChessColor::Black, 5);
+        game.apply(game.parse_uci("e2e4").unwrap());
+        game.apply(game.parse_uci("e7e5").unwrap());
+
+        // White's score rising is Black losing ground.
+        game.evals.insert(1, Score::Centipawns(0));
+        game.evals.insert(2, Score::Centipawns(500));
+        game.grade(2);
+
+        let review = &game.reviews[0];
+        assert_eq!(review.quality, Quality::Blunder);
+        assert!(review.accuracy < 40.0, "{}", review.accuracy);
+    }
+
+    #[test]
+    fn regrading_a_ply_replaces_rather_than_duplicates_its_review() {
+        let mut game = white_game();
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+
+        game.evals.insert(0, Score::Centipawns(20));
+        game.evals.insert(1, Score::Centipawns(10));
+        game.grade(1);
+        game.grade(1);
+
+        assert_eq!(game.reviews.len(), 1);
+    }
+
+    #[test]
+    fn a_takeback_discards_the_review_of_the_move_it_undoes() {
+        let mut game = white_game();
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+
+        game.evals.insert(0, Score::Centipawns(20));
+        game.evals.insert(1, Score::Centipawns(-400));
+        game.grade(1);
+        assert_eq!(game.reviews.len(), 1);
+
+        game.apply(game.parse_uci("e7e5").unwrap());
+        game.undo();
+
+        assert!(game.reviews.is_empty());
+        assert!(game.stage_summary().is_empty());
+        assert!(game.overall_accuracy().is_none());
+    }
+
+    #[test]
+    fn the_summary_reaches_a_game_that_ended() {
+        let mut game = white_game();
+        for uci in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+            game.apply(game.parse_uci(uci).unwrap());
+        }
+        assert!(game.show_summary, "the breakdown should open at game over");
     }
 
     #[test]
