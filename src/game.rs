@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use shakmaty::fen::Fen;
@@ -7,6 +7,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{Chess, Color as ChessColor, EnPassantMode, Move, Position, Role, Square};
 
 use crate::engine::Score;
+use crate::openings::Opening;
 use crate::review::{self, MoveReview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,10 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
+    /// Still in known theory. Deliberately not a centipawn verdict: main lines
+    /// routinely "lose" a few centipawns to a depth-14 search, and calling the
+    /// Najdorf an inaccuracy teaches the opposite of what a trainer should.
+    Book,
     Best,
     Good,
     Inaccuracy,
@@ -38,6 +43,7 @@ impl Quality {
 
     pub fn label(self) -> &'static str {
         match self {
+            Quality::Book => "Theory",
             Quality::Best => "Best move",
             Quality::Good => "Good move",
             Quality::Inaccuracy => "Inaccuracy",
@@ -48,6 +54,7 @@ impl Quality {
 
     pub fn color(self) -> Color {
         match self {
+            Quality::Book => Color::srgb(0.48, 0.70, 0.94),
             Quality::Best => Color::srgb(0.36, 0.80, 0.45),
             Quality::Good => Color::srgb(0.55, 0.78, 0.45),
             Quality::Inaccuracy => Color::srgb(0.95, 0.79, 0.30),
@@ -85,6 +92,14 @@ pub struct Game {
     /// Every graded player move, for the per-stage accuracy breakdown.
     pub reviews: Vec<MoveReview>,
     pub show_summary: bool,
+    /// The most specific named opening reached so far.
+    pub opening: Option<Opening>,
+    /// Plies whose resulting position was still in known theory.
+    pub book_plies: HashSet<u32>,
+    /// Fullmove number at which the game left theory, once it has.
+    pub left_book_at: Option<u32>,
+    /// What would have stayed in theory at that point, in SAN.
+    pub book_alternatives: Vec<String>,
     snapshots: Vec<Chess>,
 }
 
@@ -115,6 +130,10 @@ impl Game {
             result_text: None,
             reviews: Vec::new(),
             show_summary: false,
+            opening: None,
+            book_plies: HashSet::new(),
+            left_book_at: None,
+            book_alternatives: Vec::new(),
             snapshots: Vec::new(),
         }
     }
@@ -140,11 +159,20 @@ impl Game {
         self.result_text = None;
         // Moves that no longer happened should not still be counted against you.
         self.reviews.retain(|r| r.ply <= self.ply);
+        self.book_plies.retain(|&p| p <= self.ply);
+        // Rewinding past the point theory ended puts you back in it.
+        self.left_book_at = None;
+        self.book_alternatives.clear();
         self.phase = if self.pos.turn() == self.player {
             Phase::PlayerTurn
         } else {
             Phase::EngineThinking
         };
+    }
+
+    /// The position before the most recent move.
+    pub fn previous_position(&self) -> Option<&Chess> {
+        self.snapshots.last()
     }
 
     pub fn fen(&self) -> String {
@@ -291,11 +319,25 @@ impl Game {
             })
             .filter(|best| !played_san.ends_with(best.as_str()));
 
-        let quality = Quality::from_loss(loss);
+        // A theory move is reported as theory, whatever the search thinks of it.
+        // `book_plies` is filled by `track_opening`, which is ordered ahead of
+        // the system that calls this, so the entry is present by now.
+        let in_book = self.book_plies.contains(&ply);
+        let quality = if in_book {
+            Quality::Book
+        } else {
+            Quality::from_loss(loss)
+        };
 
-        let accuracy =
-            review::accuracy_for_mover(mover == ChessColor::White, before.to_cp(), after.to_cp());
+        // Theory is not scored, so it neither flatters nor dents your accuracy.
+        let accuracy = (!in_book).then(|| {
+            review::accuracy_for_mover(mover == ChessColor::White, before.to_cp(), after.to_cp())
+        });
         self.record_review(ply, quality, loss, accuracy, &played_san);
+
+        // Naming "the engine preferred Nc3" against a main line is the noise
+        // this whole feature exists to remove.
+        let better_san = if in_book { None } else { better_san };
 
         self.last_grade = Some(Grade {
             quality,
@@ -313,7 +355,7 @@ impl Game {
         ply: u32,
         quality: Quality,
         loss_cp: i32,
-        accuracy: f32,
+        accuracy: Option<f32>,
         san: &str,
     ) {
         let Some(pre_move) = self.snapshots.last() else {
@@ -512,7 +554,8 @@ mod tests {
         assert_eq!(review.stage, Stage::Opening);
         assert_eq!(review.quality, Quality::Best);
         // Barely anything given away, so accuracy should be near perfect.
-        assert!(review.accuracy > 95.0, "{}", review.accuracy);
+        let accuracy = review.accuracy.expect("a scored move should have one");
+        assert!(accuracy > 95.0, "{accuracy}");
     }
 
     #[test]
@@ -528,7 +571,78 @@ mod tests {
 
         let review = &game.reviews[0];
         assert_eq!(review.quality, Quality::Blunder);
-        assert!(review.accuracy < 40.0, "{}", review.accuracy);
+        let accuracy = review.accuracy.expect("a scored move should have one");
+        assert!(accuracy < 40.0, "{accuracy}");
+    }
+
+    #[test]
+    fn a_theory_move_is_reported_as_theory_and_left_unscored() {
+        let mut game = white_game();
+        game.best_moves.insert(0, "d2d4".to_string());
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+
+        // The engine mildly disapproves, but the move is known theory.
+        game.book_plies.insert(1);
+        game.evals.insert(0, Score::Centipawns(30));
+        game.evals.insert(1, Score::Centipawns(-20));
+        game.grade(1);
+
+        let grade = game.last_grade.as_ref().unwrap();
+        assert_eq!(grade.quality, Quality::Book);
+        assert_eq!(grade.quality.label(), "Theory");
+        // Naming a "better" move against a main line is the noise being removed.
+        assert_eq!(grade.better_san, None);
+
+        let review = &game.reviews[0];
+        assert_eq!(review.accuracy, None);
+        assert_eq!(game.overall_accuracy(), None);
+    }
+
+    #[test]
+    fn leaving_theory_makes_moves_scored_again() {
+        let mut game = white_game();
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+        game.book_plies.insert(1);
+        game.evals.insert(0, Score::Centipawns(30));
+        game.evals.insert(1, Score::Centipawns(20));
+        game.grade(1);
+
+        game.apply(game.parse_uci("e7e5").unwrap());
+        game.select(Square::A2);
+        game.apply(game.move_to(Square::A4).unwrap());
+        // Ply 3 is deliberately not in `book_plies`.
+        game.evals.insert(2, Score::Centipawns(20));
+        game.evals.insert(3, Score::Centipawns(-140));
+        game.grade(3);
+
+        assert_eq!(game.reviews.len(), 2);
+        assert_eq!(game.reviews[0].quality, Quality::Book);
+        assert_eq!(game.reviews[1].quality, Quality::Mistake);
+        // Only the scored move contributes.
+        assert!(game.overall_accuracy().is_some());
+
+        let opening = &game.stage_summary()[0];
+        assert_eq!(opening.book_moves, 1);
+        assert_eq!(opening.moves, 1);
+    }
+
+    #[test]
+    fn a_takeback_puts_you_back_inside_theory() {
+        let mut game = white_game();
+        game.select(Square::E2);
+        game.apply(game.move_to(Square::E4).unwrap());
+        game.book_plies.insert(1);
+        game.apply(game.parse_uci("e7e5").unwrap());
+
+        game.left_book_at = Some(2);
+        game.book_alternatives = vec!["Nf3".to_string()];
+        game.undo();
+
+        assert_eq!(game.left_book_at, None);
+        assert!(game.book_alternatives.is_empty());
+        assert!(game.book_plies.is_empty(), "{:?}", game.book_plies);
     }
 
     #[test]

@@ -2,8 +2,10 @@ use bevy::prelude::*;
 use bevy::text::FontSize;
 use shakmaty::{Color as ChessColor, Position};
 
+use crate::drill::Drill;
 use crate::engine::{EngineLink, Score};
-use crate::game::{Game, Phase};
+use crate::game::{Game, Phase, Quality};
+use crate::openings::Book;
 
 #[derive(Component)]
 pub struct StatusText;
@@ -21,6 +23,10 @@ pub struct EvalFill;
 pub struct SummaryPanel;
 #[derive(Component)]
 pub struct SummaryText;
+#[derive(Component)]
+pub struct OpeningText;
+
+const BOOK_BLUE: Color = Color::srgb(0.48, 0.70, 0.94);
 
 const PANEL_BG: Color = Color::srgba(0.07, 0.08, 0.10, 0.86);
 const TEXT_DIM: Color = Color::srgb(0.68, 0.71, 0.76);
@@ -57,6 +63,12 @@ pub fn setup(mut commands: Commands) {
                 font(15.0),
                 TextColor(TEXT_DIM),
                 StatusText,
+            ),
+            (
+                Text::new(""),
+                font(14.0),
+                TextColor(BOOK_BLUE),
+                OpeningText,
             ),
             (
                 Text::new(""),
@@ -200,6 +212,69 @@ type SummaryQuery<'w, 's> = Query<
         Without<EvalLabel>,
     ),
 >;
+type OpeningQuery<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Text,
+    (
+        With<OpeningText>,
+        Without<StatusText>,
+        Without<FeedbackText>,
+        Without<MoveListText>,
+        Without<EvalLabel>,
+        Without<SummaryText>,
+    ),
+>;
+
+/// The opening line so far: its name while theory lasts, how mainstream the
+/// position is, and where theory ran out.
+///
+/// `traffic` is the count of database lines running through the current
+/// position, and it is the honest qualifier on the name: the database names
+/// some very obscure moves, so "Ruy Lopez: Bulgarian Variation" on one line
+/// means something quite different from a position sitting on eighty.
+fn opening_line(game: &Game, traffic: usize) -> String {
+    if let Some(fullmove) = game.left_book_at {
+        let mut line = match &game.opening {
+            Some(opening) => format!("{}\nleft theory at move {fullmove}", opening.label()),
+            None => format!("Left theory at move {fullmove}"),
+        };
+        if !game.book_alternatives.is_empty() {
+            line.push_str(&format!(
+                "\nbook: {}",
+                game.book_alternatives.join(", ")
+            ));
+        }
+        return line;
+    }
+
+    let mainstream = match traffic {
+        0 => String::new(),
+        1 => "\non 1 book line".to_string(),
+        n => format!("\non {n} book lines"),
+    };
+
+    match &game.opening {
+        Some(opening) => format!("{}{mainstream}", opening.label()),
+        // In book, but no line has been named this early.
+        None => mainstream.trim_start().to_string(),
+    }
+}
+
+/// Drill status: what is being drilled, the score, and whose turn it is.
+fn drill_status(drill: &Drill, game: &Game) -> String {
+    let mut lines = vec![drill.label(), drill.score()];
+    if drill.complete {
+        if drill.missed.is_empty() {
+            lines.push("Line complete - press N to go again".to_string());
+        } else {
+            lines.push(format!("Missed: {}", drill.missed.join(", ")));
+        }
+    } else if game.pos.turn() == game.player {
+        lines.push("Find the book move".to_string());
+    }
+    lines.join("\n")
+}
 
 fn plural(n: u32, word: &str) -> String {
     if n == 1 {
@@ -219,12 +294,19 @@ fn summary_body(game: &Game) -> String {
 
     let mut lines = Vec::new();
     for stat in &stats {
-        lines.push(format!(
-            "{}   {:.0}%   {}",
-            stat.stage.label(),
-            stat.accuracy,
-            plural(stat.moves, "move")
-        ));
+        let mut headline = match stat.accuracy {
+            Some(accuracy) => format!(
+                "{}   {accuracy:.0}%   {}",
+                stat.stage.label(),
+                plural(stat.moves, "move")
+            ),
+            // Every move was theory, so there is nothing of yours to score.
+            None => format!("{}   all theory", stat.stage.label()),
+        };
+        if stat.book_moves > 0 && stat.accuracy.is_some() {
+            headline.push_str(&format!("  (+{} book)", stat.book_moves));
+        }
+        lines.push(headline);
 
         let problems = stat.problem_summary();
         if !problems.is_empty() {
@@ -243,11 +325,16 @@ fn summary_body(game: &Game) -> String {
         lines.push(format!("\nOverall   {overall:.0}%"));
     }
 
-    // With only one stage played there is nothing to compare it against.
-    if stats.len() > 1
-        && let Some(weakest) = stats.iter().min_by(|a, b| a.accuracy.total_cmp(&b.accuracy))
+    // Only stages that were actually scored can be compared, and with fewer
+    // than two of them there is nothing to compare against.
+    let scored: Vec<(&str, f32)> = stats
+        .iter()
+        .filter_map(|s| Some((s.stage.label(), s.accuracy?)))
+        .collect();
+    if scored.len() > 1
+        && let Some((stage, _)) = scored.iter().min_by(|a, b| a.1.total_cmp(&b.1))
     {
-        lines.push(format!("Weakest   {}", weakest.stage.label()));
+        lines.push(format!("Weakest   {stage}"));
     }
 
     lines.join("\n")
@@ -259,15 +346,19 @@ fn summary_body(game: &Game) -> String {
 pub fn update(
     game: Res<Game>,
     engine: Res<EngineLink>,
+    book: Res<Book>,
+    drill: Option<Res<Drill>>,
     mut status: StatusQuery,
     mut feedback: FeedbackQuery,
     mut move_list: MoveListQuery,
     mut summary: SummaryQuery,
+    mut opening: OpeningQuery,
     mut eval_label: Query<&mut Text, With<EvalLabel>>,
     mut eval_fill: Query<&mut Node, With<EvalFill>>,
     mut summary_panel: Query<&mut Node, (With<SummaryPanel>, Without<EvalFill>)>,
 ) {
-    if !game.is_changed() && !engine.is_changed() {
+    let drill_changed = drill.as_ref().is_some_and(|d| d.is_changed());
+    if !game.is_changed() && !engine.is_changed() && !drill_changed {
         return;
     }
 
@@ -278,6 +369,9 @@ pub fn update(
             "Black"
         };
         **text = match game.phase {
+            // A drill has no engine opponent and no skill level, so neither
+            // belongs in its status.
+            _ if drill.is_some() => drill_status(drill.as_ref().unwrap(), &game),
             _ if !engine.available => format!("{}\n(playing without engine)", engine.status),
             Phase::GameOver => game
                 .result_text
@@ -296,10 +390,22 @@ pub fn update(
     }
 
     if let Ok((mut text, mut color)) = feedback.single_mut() {
-        match &game.last_grade {
-            Some(grade) => {
+        // While drilling, the answer to the question is the feedback that
+        // matters; the analyst's centipawn verdict on a book move is not.
+        match (drill.as_ref(), &game.last_grade) {
+            (Some(drill), _) => {
+                **text = drill.feedback.clone().unwrap_or_default();
+                color.0 = match drill.last_ok {
+                    Some(true) => Quality::Best.color(),
+                    Some(false) => Quality::Mistake.color(),
+                    None => BOOK_BLUE,
+                };
+            }
+            (None, Some(grade)) => {
                 let mut line = format!("{}  ({})", grade.quality.label(), grade.played_san);
-                if grade.loss_cp > 10 {
+                // A theory move's centipawn cost is an artefact of the search
+                // depth, not a fault of yours, so it is not reported.
+                if grade.loss_cp > 10 && grade.quality != Quality::Book {
                     line.push_str(&format!("\nlost {:.2} pawns", grade.loss_cp as f32 / 100.0));
                 }
                 if let Some(better) = &grade.better_san {
@@ -308,10 +414,14 @@ pub fn update(
                 **text = line;
                 color.0 = grade.quality.color();
             }
-            None => {
+            (None, None) => {
                 **text = String::new();
             }
         }
+    }
+
+    if let Ok(mut text) = opening.single_mut() {
+        **text = opening_line(&game, book.traffic(&game.pos));
     }
 
     if let Ok(mut text) = move_list.single_mut() {
@@ -372,9 +482,16 @@ pub fn update(
 mod tests {
     use super::*;
     use crate::game::Quality;
+    use crate::openings::Opening;
     use crate::review::{MoveReview, Stage};
 
-    fn review(ply: u32, stage: Stage, quality: Quality, loss_cp: i32, accuracy: f32) -> MoveReview {
+    fn review(
+        ply: u32,
+        stage: Stage,
+        quality: Quality,
+        loss_cp: i32,
+        accuracy: Option<f32>,
+    ) -> MoveReview {
         MoveReview {
             ply,
             stage,
@@ -400,10 +517,10 @@ mod tests {
     #[test]
     fn the_breakdown_names_the_weakest_stage() {
         let body = summary_body(&game_with(vec![
-            review(1, Stage::Opening, Quality::Best, 0, 100.0),
-            review(3, Stage::Opening, Quality::Good, 20, 96.0),
-            review(5, Stage::Middlegame, Quality::Blunder, 310, 30.0),
-            review(7, Stage::Middlegame, Quality::Good, 20, 96.0),
+            review(1, Stage::Opening, Quality::Best, 0, Some(100.0)),
+            review(3, Stage::Opening, Quality::Good, 20, Some(96.0)),
+            review(5, Stage::Middlegame, Quality::Blunder, 310, Some(30.0)),
+            review(7, Stage::Middlegame, Quality::Good, 20, Some(96.0)),
         ]));
 
         assert!(body.contains("Opening   98%   2 moves"), "{body}");
@@ -420,11 +537,126 @@ mod tests {
             Stage::Opening,
             Quality::Best,
             0,
-            100.0,
+            Some(100.0),
         )]));
 
         assert!(body.contains("Overall   100%"), "{body}");
         assert!(!body.contains("Weakest"), "{body}");
+    }
+
+    #[test]
+    fn a_stage_of_pure_theory_is_not_given_a_percentage() {
+        let body = summary_body(&game_with(vec![
+            review(1, Stage::Opening, Quality::Book, 30, None),
+            review(3, Stage::Opening, Quality::Book, 10, None),
+            review(5, Stage::Middlegame, Quality::Good, 20, Some(96.0)),
+        ]));
+
+        assert!(body.contains("Opening   all theory"), "{body}");
+        // Memorised moves must not be scored as if you had found them.
+        assert!(!body.contains("Opening   100%"), "{body}");
+        assert!(body.contains("Overall   96%"), "{body}");
+    }
+
+    #[test]
+    fn theory_moves_are_counted_alongside_the_scored_ones() {
+        let body = summary_body(&game_with(vec![
+            review(1, Stage::Opening, Quality::Book, 0, None),
+            review(3, Stage::Opening, Quality::Book, 0, None),
+            review(5, Stage::Opening, Quality::Mistake, 150, Some(60.0)),
+        ]));
+
+        assert!(body.contains("Opening   60%   1 move  (+2 book)"), "{body}");
+    }
+
+    #[test]
+    fn an_opening_in_theory_shows_only_its_name() {
+        let mut game = game_with(Vec::new());
+        game.opening = Some(Opening {
+            eco: "B90".to_string(),
+            name: "Sicilian Defense: Najdorf Variation".to_string(),
+        });
+
+        assert_eq!(
+            opening_line(&game, 0),
+            "Sicilian Defense: Najdorf Variation (B90)"
+        );
+    }
+
+    #[test]
+    fn leaving_theory_says_where_and_what_would_have_stayed() {
+        let mut game = game_with(Vec::new());
+        game.opening = Some(Opening {
+            eco: "C60".to_string(),
+            name: "Ruy Lopez".to_string(),
+        });
+        game.left_book_at = Some(7);
+        game.book_alternatives = vec!["Nf3".to_string(), "d4".to_string()];
+
+        let line = opening_line(&game, 0);
+        assert!(line.contains("Ruy Lopez (C60)"), "{line}");
+        assert!(line.contains("left theory at move 7"), "{line}");
+        assert!(line.contains("book: Nf3, d4"), "{line}");
+    }
+
+    #[test]
+    fn an_unnamed_position_still_in_book_says_nothing() {
+        assert_eq!(opening_line(&game_with(Vec::new()), 0), "");
+    }
+
+    #[test]
+    fn a_named_line_is_qualified_by_how_mainstream_it_is() {
+        let mut game = game_with(Vec::new());
+        game.opening = Some(Opening {
+            eco: "C60".to_string(),
+            name: "Ruy Lopez".to_string(),
+        });
+
+        // The same name means something different on 84 lines than on 1.
+        assert!(opening_line(&game, 84).contains("on 84 book lines"));
+        assert!(opening_line(&game, 1).contains("on 1 book line"));
+        // Out of book there is no traffic to report.
+        assert!(!opening_line(&game, 0).contains("book line"));
+    }
+
+    #[test]
+    fn an_unnamed_book_position_still_reports_its_traffic() {
+        let line = opening_line(&game_with(Vec::new()), 12);
+        assert_eq!(line, "on 12 book lines");
+    }
+
+    #[test]
+    fn a_drill_in_progress_shows_the_score_and_the_task() {
+        let book = Book::load();
+        let drill = Drill::new(book.repertoire("Ruy Lopez").unwrap());
+        let game = Game::new(ChessColor::White, 5);
+
+        let status = drill_status(&drill, &game);
+        assert!(status.contains("Drill: Ruy Lopez"), "{status}");
+        assert!(status.contains("0/0 first try"), "{status}");
+        assert!(status.contains("Find the book move"), "{status}");
+    }
+
+    #[test]
+    fn a_finished_drill_lists_what_was_missed() {
+        let book = Book::load();
+        let mut drill = Drill::new(book.repertoire("Ruy Lopez").unwrap());
+        drill.complete = true;
+        drill.missed = vec!["Nf3".to_string(), "Bb5".to_string()];
+
+        let status = drill_status(&drill, &Game::new(ChessColor::White, 5));
+        assert!(status.contains("Missed: Nf3, Bb5"), "{status}");
+        assert!(!status.contains("Find the book move"), "{status}");
+    }
+
+    #[test]
+    fn a_clean_finish_invites_another_run_instead_of_a_miss_list() {
+        let book = Book::load();
+        let mut drill = Drill::new(book.repertoire("Ruy Lopez").unwrap());
+        drill.complete = true;
+
+        let status = drill_status(&drill, &Game::new(ChessColor::White, 5));
+        assert!(status.contains("press N to go again"), "{status}");
     }
 
     #[test]
@@ -434,7 +666,7 @@ mod tests {
             Stage::Opening,
             Quality::Best,
             0,
-            100.0,
+            Some(100.0),
         )]));
 
         assert!(body.contains("1 move\n") || body.ends_with("1 move"), "{body}");

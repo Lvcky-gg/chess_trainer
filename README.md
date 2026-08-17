@@ -32,6 +32,7 @@ are parsed at startup.
 |---|---|---|
 | `CHESS_SKILL` | `5` | Stockfish skill level, `0`–`20` |
 | `CHESS_SIDE` | `white` | `black` to play the other side |
+| `CHESS_DRILL` | — | Opening name or ECO code to drill, e.g. `Najdorf`, `B90` |
 | `STOCKFISH_PATH` | — | Explicit path to the engine binary |
 
 ## Controls
@@ -63,6 +64,63 @@ and it is classified the way most online trainers do it:
 When your move was not the analyst's choice, the better move is named in SAN.
 The bar on the left is the running evaluation, always from White's point of view.
 
+### Openings
+
+Centipawn grading is the wrong instrument in the opening. A main line can
+"lose" 20cp to a depth-14 search and still be the move everyone has played for
+a century, so the trainer names theory instead of scoring it:
+
+- while the game is in book, the panel shows the line — `Sicilian Defense:
+  Najdorf Variation (B90)` — narrowing as the game gets more specific;
+- moves in book are graded **Theory**, not Best/Inaccuracy, and are excluded
+  from accuracy entirely, so a memorised opening cannot flatter your numbers
+  and a main line cannot be called a mistake;
+- when you leave theory, it says at which move, and which moves would have
+  stayed in it.
+
+`src/assets/openings.tsv` is the [Lichess chess-openings
+database](https://github.com/lichess-org/chess-openings) (3,810 named lines,
+CC0 public domain). It is embedded at compile time and replayed into a position
+set at startup — 7,855 positions in about 10ms.
+
+**Named is not the same as usual.** The database names some very obscure moves:
+`3...a5` in the Ruy Lopez is the *Bulgarian Variation*, so "in book" alone would
+call it as respectable as `3...a6`. The book therefore also records how many
+database lines run through each position, and the panel reports it — `on 84 book
+lines` versus `on 1 book line`. It is a rough stand-in for popularity, which
+this dataset does not carry; the honest version would need the Lichess opening
+explorer's game counts.
+
+### Drilling an opening
+
+```bash
+CHESS_DRILL="Najdorf" CHESS_SIDE=black cargo run --release
+```
+
+The trainer then plays that repertoire and asks *you* for the moves. Naming
+theory as it goes by teaches recognition; a drill is the other direction — the
+position is given and the move is the answer.
+
+- the opponent replies from the same repertoire, so the line stays on rails;
+- a wrong move is taken back and the question asked again, naming the book move;
+- a retry cannot earn the point, so the score is `7/9 first try`;
+- at the end of the line, the moves you missed are listed.
+
+`CHESS_DRILL` matches an opening name (case-insensitive substring) or an exact
+ECO code. A filter matching nothing is reported and the app plays normally
+rather than silently drilling the whole database.
+
+A drill needs no engine — the book poses the questions and plays the replies —
+so it works with Stockfish absent. Takeback (`U`) is refused while drilling,
+since the drill owns the board and does its own retries. The hint key still
+shows the *analyst's* move, which is not necessarily the book move.
+
+Positions are keyed by **Polyglot-compatible Zobrist hash**, not by move
+sequence, so a line reached by transposition is recognised as the same opening —
+which is most of the point of naming openings at all. shakmaty produces those
+hashes directly (its `zobrist` module is tested against the Polyglot reference
+values), so no opening-book crate is involved.
+
 ### Accuracy by stage
 
 Per-move grades say a move cost 0.6 pawns; they never say *which part of your
@@ -70,7 +128,7 @@ game* keeps leaking. Every graded move is therefore also filed under the stage
 it was chosen in, and `S` shows the breakdown:
 
 ```
-Opening      96%   8 moves
+Opening      94%   3 moves  (+6 book)
 Middlegame   71%   18 moves
    2 mistakes, 1 blunder
    worst  19. Qd2  -3.10
@@ -79,6 +137,10 @@ Endgame      88%   9 moves
 Overall      82%
 Weakest      Middlegame
 ```
+
+The move counts are of *scored* moves; theory is listed separately and never
+averaged in. A stage played entirely from book reads `all theory` rather than
+a percentage, because there is nothing of yours in it to score.
 
 The stage is that of the position the move was *chosen in*, so the blunder that
 trades the last queens is charged to the middlegame rather than to the endgame
@@ -106,7 +168,9 @@ is not still counted against you.
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | App wiring, engine request/reply loop, keyboard |
+| `src/drill.rs` | Opening drill: poses book moves, marks answers, retries |
 | `src/game.rs` | Rules (via shakmaty), move grading, takebacks |
+| `src/openings.rs` | Named opening theory, book membership, continuations |
 | `src/review.rs` | Stage classification, accuracy, per-stage summary |
 | `src/engine.rs` | UCI client, engine worker thread, score normalisation |
 | `src/scene.rs` | Board, piece models, highlighting, camera, clicking |

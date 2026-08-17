@@ -251,6 +251,13 @@ pub fn start(skill: u32) -> EngineLink {
     start_with(discover_stockfish(), skill)
 }
 
+/// A link that reports no engine, for tests that need the resource to exist
+/// without touching Stockfish.
+#[cfg(test)]
+pub fn start_unavailable() -> EngineLink {
+    start_with(None, 0)
+}
+
 /// Discovery is a parameter so that the not-found path stays testable. Probing
 /// it through `start` would mean hiding every Stockfish on the machine — PATH
 /// and `/usr/bin` included — which no environment variable can do.

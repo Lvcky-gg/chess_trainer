@@ -107,26 +107,31 @@ pub fn accuracy_for_mover(mover_is_white: bool, before_cp: i32, after_cp: i32) -
     }
 }
 
-/// One graded player move, kept for the end-of-game breakdown.
+/// One player move, kept for the end-of-game breakdown. Theory moves are
+/// recorded too, but with no accuracy: they are not the player's work to be
+/// credited or blamed for.
 #[derive(Debug, Clone)]
 pub struct MoveReview {
     pub ply: u32,
     pub stage: Stage,
     pub quality: Quality,
     pub loss_cp: i32,
-    pub accuracy: f32,
+    pub accuracy: Option<f32>,
     pub san: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct StageStats {
     pub stage: Stage,
+    /// Moves that were actually scored, excluding theory.
     pub moves: u32,
-    pub accuracy: f32,
+    /// `None` when every move in the stage was theory.
+    pub accuracy: Option<f32>,
+    pub book_moves: u32,
     pub inaccuracies: u32,
     pub mistakes: u32,
     pub blunders: u32,
-    /// The single move that cost the most, as (SAN, centipawns lost).
+    /// The single scored move that cost the most, as (SAN, centipawns lost).
     pub worst: Option<(String, i32)>,
 }
 
@@ -153,13 +158,18 @@ pub fn summarise(reviews: &[MoveReview]) -> Vec<StageStats> {
     Stage::ALL
         .iter()
         .filter_map(|&stage| {
-            let moves: Vec<&MoveReview> = reviews.iter().filter(|r| r.stage == stage).collect();
-            if moves.is_empty() {
+            let all: Vec<&MoveReview> = reviews.iter().filter(|r| r.stage == stage).collect();
+            if all.is_empty() {
                 return None;
             }
 
-            let count = |q: Quality| moves.iter().filter(|r| r.quality == q).count() as u32;
-            let worst = moves
+            // Theory is reported but never scored, so it cannot pull an opening
+            // to 100% simply for having been memorised.
+            let scored: Vec<&&MoveReview> =
+                all.iter().filter(|r| r.quality != Quality::Book).collect();
+
+            let count = |q: Quality| scored.iter().filter(|r| r.quality == q).count() as u32;
+            let worst = scored
                 .iter()
                 .max_by_key(|r| r.loss_cp)
                 .filter(|r| r.loss_cp > 0)
@@ -167,8 +177,9 @@ pub fn summarise(reviews: &[MoveReview]) -> Vec<StageStats> {
 
             Some(StageStats {
                 stage,
-                moves: moves.len() as u32,
-                accuracy: moves.iter().map(|r| r.accuracy).sum::<f32>() / moves.len() as f32,
+                moves: scored.len() as u32,
+                accuracy: mean_accuracy(scored.iter().map(|r| **r)),
+                book_moves: (all.len() - scored.len()) as u32,
                 inaccuracies: count(Quality::Inaccuracy),
                 mistakes: count(Quality::Mistake),
                 blunders: count(Quality::Blunder),
@@ -178,11 +189,16 @@ pub fn summarise(reviews: &[MoveReview]) -> Vec<StageStats> {
         .collect()
 }
 
-pub fn overall_accuracy(reviews: &[MoveReview]) -> Option<f32> {
-    if reviews.is_empty() {
+fn mean_accuracy<'a>(reviews: impl Iterator<Item = &'a MoveReview>) -> Option<f32> {
+    let scores: Vec<f32> = reviews.filter_map(|r| r.accuracy).collect();
+    if scores.is_empty() {
         return None;
     }
-    Some(reviews.iter().map(|r| r.accuracy).sum::<f32>() / reviews.len() as f32)
+    Some(scores.iter().sum::<f32>() / scores.len() as f32)
+}
+
+pub fn overall_accuracy(reviews: &[MoveReview]) -> Option<f32> {
+    mean_accuracy(reviews.iter())
 }
 
 #[cfg(test)]
@@ -281,7 +297,7 @@ mod tests {
             stage,
             quality,
             loss_cp,
-            accuracy: 100.0 - loss_cp as f32 / 10.0,
+            accuracy: (quality != Quality::Book).then(|| 100.0 - loss_cp as f32 / 10.0),
             san: format!("move{ply}"),
         }
     }
@@ -309,7 +325,7 @@ mod tests {
 
         assert_eq!(stats[0].stage, Stage::Opening);
         assert_eq!(stats[0].moves, 2);
-        assert!((stats[0].accuracy - 99.0).abs() < 0.01);
+        assert!((stats[0].accuracy.unwrap() - 99.0).abs() < 0.01);
         assert_eq!(stats[0].problem_summary(), "");
 
         assert_eq!(stats[1].stage, Stage::Middlegame);
